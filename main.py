@@ -177,53 +177,34 @@ class CaseData:
         return factor
 
 
-def estimate_new_cohort_share(data: CaseData, jumps: list[int], idx: int,
-                              last_rate_pct: float, stale: bool) -> float:
-    """c_i: the newly tracked cohort's earn rate for trophy idx, as a fraction of the old cohort's.
+def estimate_dynamics(data: CaseData, jumps: list[int], idx: int, tier: str,
+                      last_rate_pct: float, stale: bool) -> tuple[float, float]:
+    """(c_i, g_i) for trophy idx: the new cohort's earn-rate share and the old cohort's growth.
 
-    Estimated at each observed jump by attributing the earned-count rise to the new players
-    (organic growth inside one inter-refresh interval is second-order), shrunk to a prior.
+    At each observed refresh the earned-count rise has two sources,
+
+        E_after - E_before = E_before * (exp(g * dt) - 1)   (the tracked cohort earning more)
+                           + c * r_before * (P_after - P_before)   (the new cohort's holdings),
+
+    one equation in the two unknowns (g, c) per jump; pooled over the case's jumps they separate,
+    because the organic term scales with E_before and the dilution term with the player jump.
+    Fitted by alternating least squares from the priors, then shrunk back to them by how much
+    evidence the jumps carry. On a stale page there are no jumps: the priors stand alone, with
+    c's prior shaped by the rate itself (everyone holds the boot trophy; almost no newcomer
+    holds a deep-progress one).
     """
-    observed: list[tuple[float, float]] = []  # (c_obs, weight)
-    for j in jumps:
-        p_prev, p_now = data.players[j - 1], data.players[j]
-        r_prev = data.rates[j - 1][idx]
-        r_now = data.rates[j][idx]
-        if r_prev is None or r_now is None or r_prev <= 0:
-            continue
-        e_prev = r_prev / 100.0 * p_prev
-        e_now = r_now / 100.0 * p_now
-        c_obs = (e_now - e_prev) / ((p_now - p_prev) * (r_prev / 100.0))
-        observed.append((min(1.5, max(0.0, c_obs)), p_now - p_prev))
     r_frac = last_rate_pct / 100.0
+    g_prior = TIER_GROWTH_PRIOR.get(tier, 0.26)
     if stale:
-        prior = min(1.0, max(0.02, r_frac ** 0.85))
+        c_prior = min(1.0, max(0.02, r_frac ** 0.85))
     else:
-        prior = 0.5
-    if not observed:
-        return prior
-    total_w = sum(w for _, w in observed)
-    weighted = sum(c * w for c, w in observed) / total_w
-    # Shrink the jump estimate toward the prior as if the prior were one more jump of average weight.
-    avg_w = total_w / len(observed)
-    return (total_w * weighted + avg_w * prior) / (total_w + avg_w)
+        c_prior = 0.5
+    if not jumps:
+        return c_prior, g_prior
 
-
-def estimate_growth(data: CaseData, jumps: list[int], idx: int, tier: str,
-                    share: float) -> float:
-    """Daily organic growth g_i of trophy idx's earned count within the already-tracked cohort.
-
-    Recovered from the jumps: at each refresh, remove the new cohort's holdings (at the estimated
-    share c_i) from the earned-count rise; what is left is the old cohort earning more. Pooled over
-    the jump intervals and shrunk to the per-tier prior by how much jump time was observed.
-    """
-    prior = TIER_GROWTH_PRIOR.get(tier, 0.26)
-    jump_set = set(jumps)
-    growth_num = 0.0  # sum of dln(E_old) over jump intervals
-    growth_den = 0.0  # sum of interval days
-    for j in range(1, len(data.times)):
-        if j not in jump_set:
-            continue
+    # Per-jump records: (dt_days, E_before, r_before_frac, dP, dE, weight = dP).
+    records = []
+    for j in jumps:
         r_prev = data.rates[j - 1][idx]
         r_now = data.rates[j][idx]
         if r_prev is None or r_now is None:
@@ -231,16 +212,47 @@ def estimate_growth(data: CaseData, jumps: list[int], idx: int, tier: str,
         p_prev, p_now = data.players[j - 1], data.players[j]
         e_prev = r_prev / 100.0 * p_prev
         e_now = r_now / 100.0 * p_now
-        e_old_after = e_now - share * (r_prev / 100.0) * (p_now - p_prev)
         dt_days = (data.times[j] - data.times[j - 1]) / 1440.0
-        if e_prev > 0 and e_old_after > 0 and dt_days > 0:
-            growth_num += math.log(e_old_after / e_prev)
-            growth_den += dt_days
-    if growth_den <= 0:
-        return prior
-    g = min(2.0, max(0.0, growth_num / growth_den))
-    w = growth_den / (growth_den + 0.75)
-    return w * g + (1.0 - w) * prior
+        if dt_days <= 0 or p_now <= p_prev:
+            continue
+        records.append((dt_days, e_prev, r_prev / 100.0, p_now - p_prev, e_now - e_prev, p_now - p_prev))
+    if not records:
+        return c_prior, g_prior
+
+    g = g_prior
+    c = c_prior
+    for _ in range(4):
+        # Given g, solve c by weighted least squares on the dilution term.
+        num = 0.0
+        den = 0.0
+        for dt_days, e_prev, r_prev, dp, de, w in records:
+            x = r_prev * dp
+            resid = de - e_prev * (math.exp(g * dt_days) - 1.0)
+            num += w * x * resid
+            den += w * x * x
+        if den > 0:
+            c = min(1.2, max(0.0, num / den))
+        # Given c, pool the per-jump organic growth rates.
+        g_num = 0.0
+        g_den = 0.0
+        for dt_days, e_prev, r_prev, dp, de, w in records:
+            if e_prev <= 0:
+                continue
+            resid = de - c * r_prev * dp
+            gj = math.log(1.0 + resid / e_prev) / dt_days if resid > -e_prev else -1.0 / dt_days
+            g_num += w * min(2.0, max(0.0, gj))
+            g_den += w
+        if g_den > 0:
+            g = g_num / g_den
+
+    # Shrink to the priors by the evidence: player-turnover for c, jump days observed for g.
+    total_dp = sum(rec[3] for rec in records)
+    p_last = data.players[-1] if data.players else 0.0
+    w_c = total_dp / (total_dp + p_last) if p_last > 0 else 0.0
+    jump_days = sum(rec[0] for rec in records)
+    w_g = jump_days / (jump_days + 0.75)
+    return (w_c * c + (1.0 - w_c) * c_prior,
+            w_g * g + (1.0 - w_g) * g_prior)
 
 
 def forecast_trophy(data: CaseData, jumps: list[int], stale: bool, player_factor: float,
@@ -259,17 +271,19 @@ def forecast_trophy(data: CaseData, jumps: list[int], stale: bool, player_factor
         return [round4(inv_logit_pct(lg + z * sigma)) for z in Z]
 
     r_frac = last_rate / 100.0
-    share = estimate_new_cohort_share(data, jumps, idx, last_rate, stale)
-    growth = estimate_growth(data, jumps, idx, tier, share)
+    share, growth = estimate_dynamics(data, jumps, idx, tier, last_rate, stale)
 
     # The tracked cohort keeps playing. Two views of its progress over the horizon, kept honest by
     # taking the lower: pure earned-count growth (right for rare trophies and short horizons, where
     # the non-earner pool barely dents) and a hazard step on the non-earner pool, with the hazard
     # implied by the same growth (dE/dt = lambda * (P - E)), which saturates common trophies.
-    r_grown = r_frac * math.exp(growth * d)
-    hazard = growth * r_frac / (1.0 - r_frac) if r_frac < 0.999 else 0.0
-    r_hazard = 1.0 - (1.0 - r_frac) * math.exp(-hazard * d)
-    r_existing = min(0.999, max(r_frac, min(r_grown, r_hazard)))
+    if r_frac >= 0.999:
+        r_existing = r_frac  # saturated (the boot trophy at 100%): it stays where it is
+    else:
+        r_grown = r_frac * math.exp(growth * d)
+        hazard = growth * r_frac / (1.0 - r_frac)
+        r_hazard = 1.0 - (1.0 - r_frac) * math.exp(-hazard * d)
+        r_existing = min(0.999, max(r_frac, min(r_grown, r_hazard)))
     # Players tracked between now and the target arrive progressively less far along.
     r_mid = 0.5 * (r_frac + r_existing)
     r_new = share * r_mid
